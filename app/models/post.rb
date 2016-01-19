@@ -1,14 +1,10 @@
 class Post < ActiveRecord::Base
+  CACHE_LIMIT = 100
+  PER_PAGE = 10
 
-  after_commit :invalidate_first_page, on: :create
+  belongs_to :user
 
-  #
-  # this will make sure no one uses this verion cached
-  # as it will miss this newly created record
-  #
-  def invalidate_first_page
-    $redis.del('feed:first_page')
-  end
+  after_create :push_to_all
 
   #
   # will check redis if it is there awesome return them
@@ -16,18 +12,28 @@ class Post < ActiveRecord::Base
   # and add them to redis for caching
   #  
   # DB performance
-  #  Limit  (cost=0.15..1.07 rows=10 width=100)
-  #    ->  Index Scan Backward using posts_pkey on posts  (cost=0.15..57.45 rows=620 width=100)
-  # (2 rows)
+  #   Limit  (cost=6.45..6.45 rows=1 width=40)
+  # ->  Sort  (cost=6.45..6.45 rows=1 width=40)
+  #       Sort Key: id
+  #       ->  Seq Scan on posts  (cost=0.00..6.44 rows=1 width=40)
+  #             Filter: (user_id = ANY ('{1,2,3}'::integer[]))
+  # (5 rows)
   #
-  # def self.first_page
-  #   order('id desc').limit(10).to_json
+  # def self.feed(user, offset, last_id=nil)
+  #   results = where(user_id: user.followed).order(id: :desc)
+  #   results = results.where("id < #{last_id}") if last_id
+  #   results = results.map(&:to_json)
+  #   results
   # end
   #
-  # def self.first_page_with_cache
-  #   page_name = "feed:first_page"
-  #   cached = $redis.get(page_name)
-  #   cache_and_return_page(page_name, order('id desc').limit(10).to_json)
+  # def self.feed_with_cache(user, offset, last_id=nil)
+  #   cached = get_from_cache(user.id, offset)
+  #   return cached if cached
+  # 
+  #   results = where(user_id: user.followed).order(id: :desc)
+  #   results = results.where("id < #{last_id}") if last_id
+  #   results = results.map(&:to_json)
+  #   cache_and_return_results(user.id, results)
   # end
   #
   #                  real       stime      utime      total
@@ -35,43 +41,53 @@ class Post < ActiveRecord::Base
   # without c        28.660000  0.850000   29.510000 ( 32.662422)  done 10000
   # with c           4.010000   0.170000   4.180000  (  4.182409)  done 10000
   #
-  # this means that even if we have a 50% cache miss 
+  # this means that even if we have a 65% cache miss 
   # we beat the no caching model
   #
   # we can actually try to improve this method by retrieving json from db
-  # the same applies to the next_page(id) method but in a more favorable way
-  # the next_page(id) cache can help us in retrieving pages in the future 
   #
-  # to handle the space complexity we should make expiry for the redis keys
-  # also set a maximum size for it and set the maxmemory-policy to volatile-lru
-  # but I think it is not the point of the test
+  # to handle the space complexity I make expiry for the redis keys
+  # if we set a maximum size for redis and set the maxmemory-policy to 
+  # volatile-lru
+  # redis will remove the records closest to death once it reaches the maximum 
+  # size
   #
-  def self.first_page_with_cache
-    page_name = 'feed:first_page'
-    cached = $redis.get(page_name)
-    return cached if cached
-    cache_and_return_page(page_name, order('id desc').limit(10).to_json)
+  def self.feed_with_cache(user, offset, last_id=nil)
+    logger.info "checking for cache"
+    cached = get_from_cache(user.id, offset)
+    logger.debug cached.inspect
+    return cached unless cached.blank?
+    logger.info "not cached"
+    results = where(user_id: user.followed).order(id: :desc)
+    results = results.where("id < #{last_id}") if last_id
+    results = results.map(&:to_json)
+    cache_and_return_results(user.id, results)
   end
 
-  #
-  # will check redis if it is there awesome return them
-  # if not gets the last 10 posts before the given id
-  # and add them to redis for caching
-  #
-  def self.next_page(id)
-    page_name = "feed:next_page:#{id}"
-    cached = $redis.get(page_name)
-    return cached if cached
-    cache_and_return_page(page_name,
-      where("id < #{id}").order('id desc').limit(10).to_json)
+  def self.get_from_cache(user_id, offset)
+    return nil if (offset + PER_PAGE) >= CACHE_LIMIT
+    page_name = "feed:#{user_id}"
+    results = $redis.lrange(page_name, offset, PER_PAGE)
+    $redis.expire(page_name, 86400) if results
+    results
+  end
+
+  def self.cache_and_return_results(id, json_results)
+    $redis.pipelined{ json_results.each { |result| $redis.rpush("feed:#{id}", result) } }
+    return json_results.first(10)
   end
 
 
+  private
+
   #
-  # add the page to redis
+  # this will make sure no one uses this verion cached
+  # as it will miss this newly created record
   #
-  def self.cache_and_return_page(page_name, json_results)
-    $redis.set(page_name, json_results)
-    return json_results
+  def push_to_all
+    me_in_json = self.to_json
+    followers = user.followers
+    $redis.pipelined { followers.each { |u_id| $redis.lpush("feed:#{u_id}", me_in_json) }}
   end
+
 end
